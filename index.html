@@ -66,6 +66,12 @@
   const dist  = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
 
   // =========================
+  // Global timers (MOVED UP to avoid TDZ errors)
+  // =========================
+  let time = 0;
+  let lastPingAt = -999;
+
+  // =========================
   // Canvas setup
   // =========================
   const canvas = document.getElementById("c");
@@ -97,9 +103,8 @@
     if (!audio.ctx) {
       const AC = window.AudioContext || window.webkitAudioContext;
       audio.ctx = new AC();
-
       audio.master = audio.ctx.createGain();
-      audio.master.gain.value = 0.35; // overall volume
+      audio.master.gain.value = 0.35;
       audio.master.connect(audio.ctx.destination);
     }
     if (audio.ctx.state === "suspended") audio.ctx.resume();
@@ -158,10 +163,8 @@
   }
 
   function pingSound() {
-    // sonar-like: bright blip + descending tones + tiny click
     ensureAudio();
     if (!audio.ctx) return;
-
     beep({ type:"triangle", freq: 980, dur: 0.05, gain: 0.22 });
     beep({ type:"sine",     freq: 660, dur: 0.10, gain: 0.16, when: 0.03 });
     beep({ type:"sine",     freq: 520, dur: 0.12, gain: 0.12, when: 0.06 });
@@ -171,7 +174,6 @@
   function monsterHeardSound() {
     ensureAudio();
     if (!audio.ctx) return;
-    // subtle danger tick
     beep({ type:"square", freq: 220, dur: 0.04, gain: 0.10 });
   }
 
@@ -190,7 +192,6 @@
   }
 
   function setRumble(intensity01) {
-    // continuous low rumble as monster nears (0..1)
     if (!audio.enabled || !audio.ctx) return;
     const i = clamp(intensity01, 0, 1);
 
@@ -215,12 +216,8 @@
 
   function toggleMute() {
     audio.enabled = !audio.enabled;
-    if (!audio.enabled && audio.ctx) {
-      // fade out rumble quickly
-      setRumble(0);
-    } else {
-      ensureAudio();
-    }
+    if (!audio.enabled && audio.ctx) setRumble(0);
+    else ensureAudio();
   }
 
   // =========================
@@ -235,7 +232,6 @@
   // =========================
   const keys = new Set();
   addEventListener("keydown", (e) => {
-    // unlock audio on first interaction
     ensureAudio();
 
     const watched = ["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"," ","w","a","s","d","W","A","S","D","1","2","3","m","M"];
@@ -256,7 +252,7 @@
   addEventListener("keyup", (e) => keys.delete(e.key));
 
   // =========================
-  // Maze generation (DFS perfect maze)
+  // Maze generation (DFS)
   // =========================
   function genMaze(w, h) {
     const N=0,E=1,S=2,W=3;
@@ -292,7 +288,6 @@
     return { w, h, pass };
   }
 
-  // collision: circle vs cell boundaries (MVP)
   function circleHitsWall(x, y, r, maze) {
     const cx = Math.floor(x / TILE);
     const cy = Math.floor(y / TILE);
@@ -318,18 +313,11 @@
 
   const player = { x: 0, y: 0, vx:0, vy:0, hp: 3 };
   const exitDoor = { x: 0, y: 0 };
-
-  const upgrades = {
-    pingRange: 220,
-    pingFade: 1.2,
-    lureless: false,
-  };
-
+  const upgrades = { pingRange: 220, pingFade: 1.2, lureless: false };
   const pings = []; // {x,y,t,range}
-
   const monster = { x:0, y:0, vx:0, vy:0, alerted:false, anger:0 };
 
-  // overlay upgrade UI
+  // overlay UI
   const overlay = document.getElementById("overlay");
   const choicesEl = document.getElementById("choices");
   const hudEl = document.getElementById("hud");
@@ -343,12 +331,10 @@
     const h = clamp(9 + lvl*2, 9, 39);
     maze = genMaze(w, h);
 
-    // player center
     player.x = (Math.floor(w/2) + 0.5) * TILE;
     player.y = (Math.floor(h/2) + 0.5) * TILE;
     player.vx = player.vy = 0;
 
-    // exit on a random edge
     const edge = Math.floor(Math.random()*4);
     let ex=0, ey=0;
     if (edge===0) { ex = Math.floor(Math.random()*w); ey = 0; }
@@ -358,7 +344,6 @@
     exitDoor.x = (ex + 0.5) * TILE;
     exitDoor.y = (ey + 0.5) * TILE;
 
-    // monster near exit side (simple)
     monster.x = (ex + 0.5) * TILE;
     monster.y = (ey + 0.5) * TILE;
     monster.vx = monster.vy = 0;
@@ -366,7 +351,7 @@
     monster.anger = 0;
 
     pings.length = 0;
-    lastPingAt = -999;
+    lastPingAt = -999; // now safe (declared above)
   }
 
   setupLevel(level);
@@ -390,35 +375,12 @@
 
   function makeUpgradeChoices() {
     const pool = [
-      {
-        key: "range",
-        title: "Menzil +",
-        desc: `Ses dalgası yarıçapı +60 (şu an: ${Math.round(upgrades.pingRange)})`,
-        apply: () => upgrades.pingRange += 60
-      },
-      {
-        key: "fade",
-        title: "Yankı Süresi +",
-        desc: `Görünürlük süresi +0.6s (şu an: ${upgrades.pingFade.toFixed(1)}s)`,
-        apply: () => upgrades.pingFade += 0.6
-      },
-      {
-        key: "lureless",
-        title: "Işık Süzmesi",
-        desc: upgrades.lureless
-          ? "Zaten açık: Ping canavarı çekmiyor."
-          : "Ping atınca canavar artık yönlenmez (güvenli ping).",
-        apply: () => upgrades.lureless = true
-      },
-      {
-        key: "hp",
-        title: "Can +1",
-        desc: `Can +1 (şu an: ${player.hp})`,
-        apply: () => player.hp += 1
-      }
+      { title:"Menzil +", desc:`Ses dalgası yarıçapı +60 (şu an: ${Math.round(upgrades.pingRange)})`, apply:()=> upgrades.pingRange += 60 },
+      { title:"Yankı Süresi +", desc:`Görünürlük süresi +0.6s (şu an: ${upgrades.pingFade.toFixed(1)}s)`, apply:()=> upgrades.pingFade += 0.6 },
+      { title:"Işık Süzmesi", desc: upgrades.lureless ? "Zaten açık: Ping canavarı çekmiyor." : "Ping atınca canavar yönlenmez (güvenli ping).", apply:()=> upgrades.lureless = true },
+      { title:"Can +1", desc:`Can +1 (şu an: ${player.hp})`, apply:()=> player.hp += 1 },
     ];
-    const shuffled = pool.sort(() => Math.random()-0.5);
-    return shuffled.slice(0, 3);
+    return pool.sort(()=>Math.random()-0.5).slice(0,3);
   }
 
   function renderUpgradeChoices() {
@@ -437,15 +399,12 @@
     if (!choice) return;
     choice.apply();
     closeUpgradeOverlay();
-    // small reveal ping (safe visual only)
     pings.push({ x: player.x, y: player.y, t: 0, range: upgrades.pingRange });
   }
 
   // =========================
-  // Ping / Echolocation
+  // Ping
   // =========================
-  let time = 0;
-  let lastPingAt = -999;
   const pingCooldown = 0.45;
 
   function tryPing() {
@@ -454,11 +413,8 @@
     lastPingAt = time;
 
     pings.push({ x: player.x, y: player.y, t: 0, range: upgrades.pingRange });
-
-    // play ping SFX
     pingSound();
 
-    // monster hears unless lureless
     if (!upgrades.lureless) {
       monster.alerted = true;
       monster.anger = 2.8;
@@ -467,7 +423,7 @@
   }
 
   // =========================
-  // Game loop
+  // Loop
   // =========================
   let last = performance.now();
 
@@ -484,7 +440,6 @@
   function update(dt) {
     time += dt;
 
-    // movement
     const speed = 130;
     let ix = 0, iy = 0;
     if (keys.has("ArrowUp") || keys.has("w") || keys.has("W")) iy -= 1;
@@ -501,23 +456,17 @@
     if (!circleHitsWall(nx, player.y, PLAYER_R, maze)) player.x = nx;
     if (!circleHitsWall(player.x, ny, PLAYER_R, maze)) player.y = ny;
 
-    // ping decay
     for (let i = pings.length - 1; i >= 0; i--) {
       pings[i].t += dt;
       if (pings[i].t > upgrades.pingFade) pings.splice(i, 1);
     }
 
-    // monster move
     const baseMs = 85 + level * 5;
     if (monster.anger > 0) monster.anger -= dt;
 
     let tx, ty;
-    if (monster.alerted && monster.anger > 0) {
-      tx = player.x; ty = player.y;
-    } else {
-      monster.alerted = false;
-      tx = exitDoor.x; ty = exitDoor.y;
-    }
+    if (monster.alerted && monster.anger > 0) { tx = player.x; ty = player.y; }
+    else { monster.alerted = false; tx = exitDoor.x; ty = exitDoor.y; }
 
     const mdx = tx - monster.x, mdy = ty - monster.y;
     const d = Math.hypot(mdx, mdy) || 1;
@@ -529,18 +478,15 @@
     if (!circleHitsWall(mNextX, monster.y, MONSTER_R, maze)) monster.x = mNextX;
     if (!circleHitsWall(monster.x, mNextY, MONSTER_R, maze)) monster.y = mNextY;
 
-    // rumble based on distance (only after audio unlocked)
     const dToMonster = dist(monster.x, monster.y, player.x, player.y);
     const intensity = 1 - clamp(dToMonster / 260, 0, 1);
     setRumble(intensity);
 
-    // monster catches player
     if (dToMonster < (MONSTER_R + PLAYER_R + 2)) {
       player.hp -= 1;
       hurtThud();
 
       if (player.hp <= 0) {
-        // full restart
         player.hp = 3;
         upgrades.pingRange = 220;
         upgrades.pingFade = 1.2;
@@ -552,7 +498,6 @@
       return;
     }
 
-    // reach exit
     if (dist(player.x, player.y, exitDoor.x, exitDoor.y) < 12) {
       exitChime();
       setupLevel(level + 1);
@@ -562,11 +507,10 @@
   }
 
   // =========================
-  // Rendering: darkness + sonar reveal
+  // Rendering
   // =========================
   function render() {
     const W = innerWidth, H = innerHeight;
-
     const camX = player.x - W/2;
     const camY = player.y - H/2;
 
@@ -637,7 +581,6 @@
       }
     }
 
-    // exit door
     ctx.save();
     ctx.fillStyle = "rgba(60, 255, 140, 0.95)";
     ctx.strokeStyle = "rgba(0,0,0,0.6)";
@@ -650,7 +593,6 @@
   }
 
   function drawEntities(camX, camY) {
-    // player
     ctx.save();
     ctx.fillStyle = "rgba(255,255,255,0.95)";
     ctx.beginPath();
@@ -658,7 +600,6 @@
     ctx.fill();
     ctx.restore();
 
-    // monster
     ctx.save();
     ctx.fillStyle = "rgba(255, 80, 80, 0.95)";
     ctx.beginPath();
