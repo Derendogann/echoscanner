@@ -1,0 +1,680 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Ekolokasyon Labirenti (MVP + Ses)</title>
+  <style>
+    html, body { margin:0; height:100%; background:#000; overflow:hidden; }
+    canvas { display:block; width:100vw; height:100vh; image-rendering:pixelated; }
+    .hud {
+      position:fixed; left:12px; top:12px; color:#d7d7d7; font:14px/1.35 system-ui, -apple-system, Segoe UI, Roboto;
+      background:rgba(0,0,0,.35); padding:10px 12px; border:1px solid rgba(255,255,255,.12); border-radius:12px;
+      max-width: 560px;
+    }
+    .hud b { color:#fff; }
+    .overlay {
+      position:fixed; inset:0; display:none; align-items:center; justify-content:center;
+      background:rgba(0,0,0,.55);
+    }
+    .card {
+      width:min(520px, calc(100vw - 28px));
+      background:rgba(10,10,10,.9);
+      border:1px solid rgba(255,255,255,.15);
+      border-radius:16px;
+      padding:16px;
+      color:#eaeaea;
+      font:14px/1.4 system-ui, -apple-system, Segoe UI, Roboto;
+      box-shadow: 0 10px 30px rgba(0,0,0,.45);
+    }
+    .card h2 { margin:0 0 10px; font-size:18px; }
+    .choices { display:grid; gap:10px; margin-top:12px; }
+    button {
+      all:unset; cursor:pointer; padding:10px 12px; border-radius:12px;
+      background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.15);
+    }
+    button:hover { background:rgba(255,255,255,.10); }
+    .muted { color:#bdbdbd; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid rgba(255,255,255,.18); font-size:12px; margin-left:8px; }
+    kbd {
+      font: 12px/1.2 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      padding:2px 6px; border-radius:6px; border:1px solid rgba(255,255,255,.18);
+      background:rgba(255,255,255,.06); color:#fff;
+    }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="hud" id="hud"></div>
+
+<div class="overlay" id="overlay">
+  <div class="card">
+    <h2>Seviye Geçildi 🎉 <span class="pill" id="lvlPill"></span></h2>
+    <div class="muted">Bir upgrade seç (<kbd>1</kbd> / <kbd>2</kbd> / <kbd>3</kbd> tuşlarıyla da seçebilirsin).</div>
+    <div class="choices" id="choices"></div>
+  </div>
+</div>
+
+<script>
+(() => {
+  // =========================
+  // Utils
+  // =========================
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp  = (a, b, t) => a + (b - a) * t;
+  const dist  = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
+
+  // =========================
+  // Canvas setup
+  // =========================
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d", { alpha:false });
+
+  function resize() {
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    canvas.width = Math.floor(innerWidth * dpr);
+    canvas.height = Math.floor(innerHeight * dpr);
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  addEventListener("resize", resize);
+  resize();
+
+  // =========================
+  // Audio (Web Audio API)
+  // =========================
+  const audio = {
+    ctx: null,
+    master: null,
+    enabled: true,
+    unlocked: false,
+    rumbleOsc: null,
+    rumbleGain: null,
+  };
+
+  function ensureAudio() {
+    if (!audio.enabled) return;
+    if (!audio.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      audio.ctx = new AC();
+
+      audio.master = audio.ctx.createGain();
+      audio.master.gain.value = 0.35; // overall volume
+      audio.master.connect(audio.ctx.destination);
+    }
+    if (audio.ctx.state === "suspended") audio.ctx.resume();
+    audio.unlocked = true;
+  }
+
+  function beep({ type="sine", freq=440, dur=0.08, gain=0.25, when=0, attack=0.005, release=0.03 } = {}) {
+    if (!audio.enabled || !audio.ctx) return;
+    const t0 = audio.ctx.currentTime + when;
+
+    const osc = audio.ctx.createOscillator();
+    const g = audio.ctx.createGain();
+
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t0);
+
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(Math.max(0.0002, gain), t0 + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + Math.max(attack + 0.001, dur));
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur + release);
+
+    osc.connect(g);
+    g.connect(audio.master);
+
+    osc.start(t0);
+    osc.stop(t0 + dur + release + 0.02);
+  }
+
+  function noiseBurst({ dur=0.06, gain=0.18, hp=700, when=0 } = {}) {
+    if (!audio.enabled || !audio.ctx) return;
+    const t0 = audio.ctx.currentTime + when;
+
+    const bufferSize = Math.max(1, Math.floor(audio.ctx.sampleRate * dur));
+    const buffer = audio.ctx.createBuffer(1, bufferSize, audio.ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i=0;i<bufferSize;i++) data[i] = (Math.random()*2 - 1);
+
+    const src = audio.ctx.createBufferSource();
+    src.buffer = buffer;
+
+    const hpFilter = audio.ctx.createBiquadFilter();
+    hpFilter.type = "highpass";
+    hpFilter.frequency.value = hp;
+
+    const g = audio.ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(Math.max(0.0002, gain), t0 + 0.003);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+
+    src.connect(hpFilter);
+    hpFilter.connect(g);
+    g.connect(audio.master);
+
+    src.start(t0);
+    src.stop(t0 + dur + 0.02);
+  }
+
+  function pingSound() {
+    // sonar-like: bright blip + descending tones + tiny click
+    ensureAudio();
+    if (!audio.ctx) return;
+
+    beep({ type:"triangle", freq: 980, dur: 0.05, gain: 0.22 });
+    beep({ type:"sine",     freq: 660, dur: 0.10, gain: 0.16, when: 0.03 });
+    beep({ type:"sine",     freq: 520, dur: 0.12, gain: 0.12, when: 0.06 });
+    noiseBurst({ dur: 0.03, gain: 0.10, hp: 1000, when: 0.01 });
+  }
+
+  function monsterHeardSound() {
+    ensureAudio();
+    if (!audio.ctx) return;
+    // subtle danger tick
+    beep({ type:"square", freq: 220, dur: 0.04, gain: 0.10 });
+  }
+
+  function exitChime() {
+    ensureAudio();
+    if (!audio.ctx) return;
+    beep({ type:"sine", freq: 784, dur: 0.10, gain: 0.12 });
+    beep({ type:"sine", freq: 988, dur: 0.12, gain: 0.10, when: 0.07 });
+  }
+
+  function hurtThud() {
+    ensureAudio();
+    if (!audio.ctx) return;
+    beep({ type:"sine", freq: 90, dur: 0.08, gain: 0.22 });
+    noiseBurst({ dur: 0.05, gain: 0.10, hp: 200, when: 0.0 });
+  }
+
+  function setRumble(intensity01) {
+    // continuous low rumble as monster nears (0..1)
+    if (!audio.enabled || !audio.ctx) return;
+    const i = clamp(intensity01, 0, 1);
+
+    if (!audio.rumbleOsc) {
+      audio.rumbleOsc = audio.ctx.createOscillator();
+      audio.rumbleOsc.type = "sine";
+      audio.rumbleGain = audio.ctx.createGain();
+      audio.rumbleGain.gain.value = 0.0001;
+
+      audio.rumbleOsc.connect(audio.rumbleGain);
+      audio.rumbleGain.connect(audio.master);
+      audio.rumbleOsc.start();
+    }
+
+    const t = audio.ctx.currentTime;
+    const freq = lerp(45, 85, i);
+    const gain = lerp(0.0001, 0.10, i*i);
+
+    audio.rumbleOsc.frequency.setTargetAtTime(freq, t, 0.03);
+    audio.rumbleGain.gain.setTargetAtTime(gain, t, 0.06);
+  }
+
+  function toggleMute() {
+    audio.enabled = !audio.enabled;
+    if (!audio.enabled && audio.ctx) {
+      // fade out rumble quickly
+      setRumble(0);
+    } else {
+      ensureAudio();
+    }
+  }
+
+  // =========================
+  // Game constants
+  // =========================
+  const TILE = 22;
+  const PLAYER_R = 7;
+  const MONSTER_R = 8;
+
+  // =========================
+  // Input
+  // =========================
+  const keys = new Set();
+  addEventListener("keydown", (e) => {
+    // unlock audio on first interaction
+    ensureAudio();
+
+    const watched = ["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"," ","w","a","s","d","W","A","S","D","1","2","3","m","M"];
+    if (watched.includes(e.key)) e.preventDefault();
+
+    keys.add(e.key);
+
+    if (e.key === " ") tryPing();
+    if (e.key === "m" || e.key === "M") toggleMute();
+
+    if (overlayOpen) {
+      if (e.key === "1") pickUpgrade(0);
+      if (e.key === "2") pickUpgrade(1);
+      if (e.key === "3") pickUpgrade(2);
+    }
+  }, { passive:false });
+
+  addEventListener("keyup", (e) => keys.delete(e.key));
+
+  // =========================
+  // Maze generation (DFS perfect maze)
+  // =========================
+  function genMaze(w, h) {
+    const N=0,E=1,S=2,W=3;
+    const dx = [0,1,0,-1];
+    const dy = [-1,0,1,0];
+    const opp = [2,3,0,1];
+
+    const visited = Array.from({length:h}, () => Array(w).fill(false));
+    const pass = Array.from({length:h}, () => Array.from({length:w}, () => [false,false,false,false]));
+
+    const stack = [];
+    const sx = Math.floor(w/2), sy = Math.floor(h/2);
+    stack.push([sx, sy]); visited[sy][sx] = true;
+
+    while (stack.length) {
+      const [cx, cy] = stack[stack.length - 1];
+      const dirs = [0,1,2,3].sort(() => Math.random()-0.5);
+      let moved = false;
+
+      for (const d of dirs) {
+        const nx = cx + dx[d], ny = cy + dy[d];
+        if (nx<0 || ny<0 || nx>=w || ny>=h) continue;
+        if (visited[ny][nx]) continue;
+        pass[cy][cx][d] = true;
+        pass[ny][nx][opp[d]] = true;
+        visited[ny][nx] = true;
+        stack.push([nx, ny]);
+        moved = true;
+        break;
+      }
+      if (!moved) stack.pop();
+    }
+    return { w, h, pass };
+  }
+
+  // collision: circle vs cell boundaries (MVP)
+  function circleHitsWall(x, y, r, maze) {
+    const cx = Math.floor(x / TILE);
+    const cy = Math.floor(y / TILE);
+    if (cx < 0 || cy < 0 || cx >= maze.w || cy >= maze.h) return true;
+
+    const cellX = cx * TILE;
+    const cellY = cy * TILE;
+    const N=0,E=1,S=2,W=3;
+
+    if (!maze.pass[cy][cx][N] && (y - r) < cellY) return true;
+    if (!maze.pass[cy][cx][S] && (y + r) > (cellY + TILE)) return true;
+    if (!maze.pass[cy][cx][W] && (x - r) < cellX) return true;
+    if (!maze.pass[cy][cx][E] && (x + r) > (cellX + TILE)) return true;
+
+    return false;
+  }
+
+  // =========================
+  // Game state
+  // =========================
+  let level = 1;
+  let maze = null;
+
+  const player = { x: 0, y: 0, vx:0, vy:0, hp: 3 };
+  const exitDoor = { x: 0, y: 0 };
+
+  const upgrades = {
+    pingRange: 220,
+    pingFade: 1.2,
+    lureless: false,
+  };
+
+  const pings = []; // {x,y,t,range}
+
+  const monster = { x:0, y:0, vx:0, vy:0, alerted:false, anger:0 };
+
+  // overlay upgrade UI
+  const overlay = document.getElementById("overlay");
+  const choicesEl = document.getElementById("choices");
+  const hudEl = document.getElementById("hud");
+  const lvlPill = document.getElementById("lvlPill");
+  let overlayOpen = false;
+  let pendingChoices = [];
+
+  function setupLevel(lvl) {
+    level = lvl;
+    const w = clamp(9 + lvl*2, 9, 39);
+    const h = clamp(9 + lvl*2, 9, 39);
+    maze = genMaze(w, h);
+
+    // player center
+    player.x = (Math.floor(w/2) + 0.5) * TILE;
+    player.y = (Math.floor(h/2) + 0.5) * TILE;
+    player.vx = player.vy = 0;
+
+    // exit on a random edge
+    const edge = Math.floor(Math.random()*4);
+    let ex=0, ey=0;
+    if (edge===0) { ex = Math.floor(Math.random()*w); ey = 0; }
+    if (edge===1) { ex = w-1; ey = Math.floor(Math.random()*h); }
+    if (edge===2) { ex = Math.floor(Math.random()*w); ey = h-1; }
+    if (edge===3) { ex = 0; ey = Math.floor(Math.random()*h); }
+    exitDoor.x = (ex + 0.5) * TILE;
+    exitDoor.y = (ey + 0.5) * TILE;
+
+    // monster near exit side (simple)
+    monster.x = (ex + 0.5) * TILE;
+    monster.y = (ey + 0.5) * TILE;
+    monster.vx = monster.vy = 0;
+    monster.alerted = false;
+    monster.anger = 0;
+
+    pings.length = 0;
+    lastPingAt = -999;
+  }
+
+  setupLevel(level);
+
+  // =========================
+  // Upgrades
+  // =========================
+  function openUpgradeOverlay() {
+    overlayOpen = true;
+    overlay.style.display = "flex";
+    lvlPill.textContent = `Level ${level}`;
+    pendingChoices = makeUpgradeChoices();
+    renderUpgradeChoices();
+  }
+
+  function closeUpgradeOverlay() {
+    overlayOpen = false;
+    overlay.style.display = "none";
+    pendingChoices = [];
+  }
+
+  function makeUpgradeChoices() {
+    const pool = [
+      {
+        key: "range",
+        title: "Menzil +",
+        desc: `Ses dalgası yarıçapı +60 (şu an: ${Math.round(upgrades.pingRange)})`,
+        apply: () => upgrades.pingRange += 60
+      },
+      {
+        key: "fade",
+        title: "Yankı Süresi +",
+        desc: `Görünürlük süresi +0.6s (şu an: ${upgrades.pingFade.toFixed(1)}s)`,
+        apply: () => upgrades.pingFade += 0.6
+      },
+      {
+        key: "lureless",
+        title: "Işık Süzmesi",
+        desc: upgrades.lureless
+          ? "Zaten açık: Ping canavarı çekmiyor."
+          : "Ping atınca canavar artık yönlenmez (güvenli ping).",
+        apply: () => upgrades.lureless = true
+      },
+      {
+        key: "hp",
+        title: "Can +1",
+        desc: `Can +1 (şu an: ${player.hp})`,
+        apply: () => player.hp += 1
+      }
+    ];
+    const shuffled = pool.sort(() => Math.random()-0.5);
+    return shuffled.slice(0, 3);
+  }
+
+  function renderUpgradeChoices() {
+    choicesEl.innerHTML = "";
+    pendingChoices.forEach((c, i) => {
+      const btn = document.createElement("button");
+      btn.innerHTML = `<b>${i+1}) ${c.title}</b><div class="muted" style="margin-top:4px">${c.desc}</div>`;
+      btn.addEventListener("click", () => pickUpgrade(i));
+      choicesEl.appendChild(btn);
+    });
+  }
+
+  function pickUpgrade(i) {
+    if (!overlayOpen) return;
+    const choice = pendingChoices[i];
+    if (!choice) return;
+    choice.apply();
+    closeUpgradeOverlay();
+    // small reveal ping (safe visual only)
+    pings.push({ x: player.x, y: player.y, t: 0, range: upgrades.pingRange });
+  }
+
+  // =========================
+  // Ping / Echolocation
+  // =========================
+  let time = 0;
+  let lastPingAt = -999;
+  const pingCooldown = 0.45;
+
+  function tryPing() {
+    if (overlayOpen) return;
+    if (time - lastPingAt < pingCooldown) return;
+    lastPingAt = time;
+
+    pings.push({ x: player.x, y: player.y, t: 0, range: upgrades.pingRange });
+
+    // play ping SFX
+    pingSound();
+
+    // monster hears unless lureless
+    if (!upgrades.lureless) {
+      monster.alerted = true;
+      monster.anger = 2.8;
+      monsterHeardSound();
+    }
+  }
+
+  // =========================
+  // Game loop
+  // =========================
+  let last = performance.now();
+
+  function step(now) {
+    const dt = Math.min(0.033, (now - last) / 1000);
+    last = now;
+
+    if (!overlayOpen) update(dt);
+    render();
+    requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+
+  function update(dt) {
+    time += dt;
+
+    // movement
+    const speed = 130;
+    let ix = 0, iy = 0;
+    if (keys.has("ArrowUp") || keys.has("w") || keys.has("W")) iy -= 1;
+    if (keys.has("ArrowDown") || keys.has("s") || keys.has("S")) iy += 1;
+    if (keys.has("ArrowLeft") || keys.has("a") || keys.has("A")) ix -= 1;
+    if (keys.has("ArrowRight") || keys.has("d") || keys.has("D")) ix += 1;
+
+    const ilen = Math.hypot(ix, iy) || 1;
+    ix /= ilen; iy /= ilen;
+
+    const nx = player.x + ix * speed * dt;
+    const ny = player.y + iy * speed * dt;
+
+    if (!circleHitsWall(nx, player.y, PLAYER_R, maze)) player.x = nx;
+    if (!circleHitsWall(player.x, ny, PLAYER_R, maze)) player.y = ny;
+
+    // ping decay
+    for (let i = pings.length - 1; i >= 0; i--) {
+      pings[i].t += dt;
+      if (pings[i].t > upgrades.pingFade) pings.splice(i, 1);
+    }
+
+    // monster move
+    const baseMs = 85 + level * 5;
+    if (monster.anger > 0) monster.anger -= dt;
+
+    let tx, ty;
+    if (monster.alerted && monster.anger > 0) {
+      tx = player.x; ty = player.y;
+    } else {
+      monster.alerted = false;
+      tx = exitDoor.x; ty = exitDoor.y;
+    }
+
+    const mdx = tx - monster.x, mdy = ty - monster.y;
+    const d = Math.hypot(mdx, mdy) || 1;
+    const mx = (mdx / d) * baseMs;
+    const my = (mdy / d) * baseMs;
+
+    const mNextX = monster.x + mx * dt;
+    const mNextY = monster.y + my * dt;
+    if (!circleHitsWall(mNextX, monster.y, MONSTER_R, maze)) monster.x = mNextX;
+    if (!circleHitsWall(monster.x, mNextY, MONSTER_R, maze)) monster.y = mNextY;
+
+    // rumble based on distance (only after audio unlocked)
+    const dToMonster = dist(monster.x, monster.y, player.x, player.y);
+    const intensity = 1 - clamp(dToMonster / 260, 0, 1);
+    setRumble(intensity);
+
+    // monster catches player
+    if (dToMonster < (MONSTER_R + PLAYER_R + 2)) {
+      player.hp -= 1;
+      hurtThud();
+
+      if (player.hp <= 0) {
+        // full restart
+        player.hp = 3;
+        upgrades.pingRange = 220;
+        upgrades.pingFade = 1.2;
+        upgrades.lureless = false;
+        setupLevel(1);
+      } else {
+        setupLevel(level);
+      }
+      return;
+    }
+
+    // reach exit
+    if (dist(player.x, player.y, exitDoor.x, exitDoor.y) < 12) {
+      exitChime();
+      setupLevel(level + 1);
+      openUpgradeOverlay();
+      return;
+    }
+  }
+
+  // =========================
+  // Rendering: darkness + sonar reveal
+  // =========================
+  function render() {
+    const W = innerWidth, H = innerHeight;
+
+    const camX = player.x - W/2;
+    const camY = player.y - H/2;
+
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0,0,W,H);
+
+    for (const p of pings) {
+      const t = p.t / upgrades.pingFade;
+      const radius = lerp(0, p.range, clamp(p.t / 0.25, 0, 1));
+      const alpha = 1 - t;
+
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.beginPath();
+      ctx.arc(p.x - camX, p.y - camY, radius, 0, Math.PI*2);
+      ctx.clip();
+
+      drawMaze(camX, camY);
+      drawEntities(camX, camY);
+
+      ctx.restore();
+    }
+
+    hudEl.innerHTML = `
+      <div><b>Ekolokasyon Labirenti</b> — <span class="muted">WASD/Ok: hareket · Space: ping · <kbd>M</kbd>: ses</span></div>
+      <div class="muted" style="margin-top:6px">
+        Level: <b>${level}</b> · Can: <b>${player.hp}</b>
+        · Ping menzil: <b>${Math.round(upgrades.pingRange)}</b>
+        · Yankı: <b>${upgrades.pingFade.toFixed(1)}s</b>
+        · Işık Süzmesi: <b>${upgrades.lureless ? "Açık" : "Kapalı"}</b>
+        · Ses: <b>${audio.enabled ? "Açık" : "Kapalı"}</b>
+      </div>
+      <div class="muted" style="margin-top:6px">
+        Amaç: Çıkış kapısını bul (yeşil). Ping atınca ortam anlık görünür.
+        (Işık Süzmesi kapalıysa canavar sesi duyar.)
+      </div>
+    `;
+  }
+
+  function drawMaze(camX, camY) {
+    const { w, h, pass } = maze;
+
+    const x0 = Math.floor(camX / TILE) - 2;
+    const y0 = Math.floor(camY / TILE) - 2;
+    const x1 = Math.floor((camX + innerWidth) / TILE) + 2;
+    const y1 = Math.floor((camY + innerHeight) / TILE) + 2;
+
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "rgba(230,230,230,0.9)";
+    ctx.fillStyle = "rgba(255,255,255,0.06)";
+
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        if (x<0 || y<0 || x>=w || y>=h) continue;
+
+        const px = x * TILE - camX;
+        const py = y * TILE - camY;
+
+        ctx.fillRect(px, py, TILE, TILE);
+
+        const N=0,E=1,S=2,W=3;
+        ctx.beginPath();
+        if (!pass[y][x][N]) { ctx.moveTo(px, py); ctx.lineTo(px+TILE, py); }
+        if (!pass[y][x][S]) { ctx.moveTo(px, py+TILE); ctx.lineTo(px+TILE, py+TILE); }
+        if (!pass[y][x][W]) { ctx.moveTo(px, py); ctx.lineTo(px, py+TILE); }
+        if (!pass[y][x][E]) { ctx.moveTo(px+TILE, py); ctx.lineTo(px+TILE, py+TILE); }
+        ctx.stroke();
+      }
+    }
+
+    // exit door
+    ctx.save();
+    ctx.fillStyle = "rgba(60, 255, 140, 0.95)";
+    ctx.strokeStyle = "rgba(0,0,0,0.6)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(exitDoor.x - camX, exitDoor.y - camY, 8, 0, Math.PI*2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawEntities(camX, camY) {
+    // player
+    ctx.save();
+    ctx.fillStyle = "rgba(255,255,255,0.95)";
+    ctx.beginPath();
+    ctx.arc(player.x - camX, player.y - camY, PLAYER_R, 0, Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+
+    // monster
+    ctx.save();
+    ctx.fillStyle = "rgba(255, 80, 80, 0.95)";
+    ctx.beginPath();
+    ctx.arc(monster.x - camX, monster.y - camY, MONSTER_R, 0, Math.PI*2);
+    ctx.fill();
+
+    if (monster.alerted && monster.anger > 0) {
+      ctx.globalAlpha = 0.25;
+      ctx.beginPath();
+      ctx.arc(monster.x - camX, monster.y - camY, 18, 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+})();
+</script>
+</body>
+</html>
