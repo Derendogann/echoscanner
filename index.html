@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Ekolokasyon Labirenti (MVP + Ses)</title>
+  <title>Ekolokasyon Labirenti (Halo + Trail + Ses + Canavar Fix)</title>
   <style>
     html, body { margin:0; height:100%; background:#000; overflow:hidden; }
     canvas { display:block; width:100vw; height:100vh; image-rendering:pixelated; }
     .hud {
       position:fixed; left:12px; top:12px; color:#d7d7d7; font:14px/1.35 system-ui, -apple-system, Segoe UI, Roboto;
       background:rgba(0,0,0,.35); padding:10px 12px; border:1px solid rgba(255,255,255,.12); border-radius:12px;
-      max-width: 560px;
+      max-width: 600px;
     }
     .hud b { color:#fff; }
     .overlay {
@@ -51,7 +51,7 @@
 <div class="overlay" id="overlay">
   <div class="card">
     <h2>Seviye Geçildi 🎉 <span class="pill" id="lvlPill"></span></h2>
-    <div class="muted">Bir upgrade seç (<kbd>1</kbd> / <kbd>2</kbd> / <kbd>3</kbd> tuşlarıyla da seçebilirsin).</div>
+    <div class="muted">Bir upgrade seç (<kbd>1</kbd> / <kbd>2</kbd> / <kbd>3</kbd> ile de seçebilirsin).</div>
     <div class="choices" id="choices"></div>
   </div>
 </div>
@@ -65,11 +65,9 @@
   const lerp  = (a, b, t) => a + (b - a) * t;
   const dist  = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
 
-  // =========================
-  // Global timers (MOVED UP to avoid TDZ errors)
-  // =========================
-  let time = 0;
-  let lastPingAt = -999;
+  // ---- FIX: timers at top (avoid TDZ / cache weirdness) ----
+  var time = 0;
+  var lastPingAt = -999;
 
   // =========================
   // Canvas setup
@@ -93,7 +91,6 @@
     ctx: null,
     master: null,
     enabled: true,
-    unlocked: false,
     rumbleOsc: null,
     rumbleGain: null,
   };
@@ -108,7 +105,6 @@
       audio.master.connect(audio.ctx.destination);
     }
     if (audio.ctx.state === "suspended") audio.ctx.resume();
-    audio.unlocked = true;
   }
 
   function beep({ type="sine", freq=440, dur=0.08, gain=0.25, when=0, attack=0.005, release=0.03 } = {}) {
@@ -248,11 +244,10 @@
       if (e.key === "3") pickUpgrade(2);
     }
   }, { passive:false });
-
   addEventListener("keyup", (e) => keys.delete(e.key));
 
   // =========================
-  // Maze generation (DFS)
+  // Maze generation (DFS perfect maze)
   // =========================
   function genMaze(w, h) {
     const N=0,E=1,S=2,W=3;
@@ -288,6 +283,7 @@
     return { w, h, pass };
   }
 
+  // collision: circle vs cell boundaries (MVP)
   function circleHitsWall(x, y, r, maze) {
     const cx = Math.floor(x / TILE);
     const cy = Math.floor(y / TILE);
@@ -305,19 +301,80 @@
     return false;
   }
 
+  // "takılma" azaltan hareket: önce X/Y dene, olmazsa alternatif yön dene
+  function tryMoveCircle(entity, vx, vy, r, maze, dt) {
+    let moved = false;
+
+    const nx = entity.x + vx * dt;
+    const ny = entity.y + vy * dt;
+
+    // try axis slide
+    if (!circleHitsWall(nx, entity.y, r, maze)) { entity.x = nx; moved = true; }
+    if (!circleHitsWall(entity.x, ny, r, maze)) { entity.y = ny; moved = true; }
+
+    if (moved) return true;
+
+    // if stuck: try perpendicular directions (wall-follow feel)
+    const px1 = -vy, py1 = vx;
+    const px2 =  vy, py2 = -vx;
+
+    const pLen1 = Math.hypot(px1, py1) || 1;
+    const pLen2 = Math.hypot(px2, py2) || 1;
+
+    const speed = Math.hypot(vx, vy);
+    const ax1 = (px1 / pLen1) * speed;
+    const ay1 = (py1 / pLen1) * speed;
+    const ax2 = (px2 / pLen2) * speed;
+    const ay2 = (py2 / pLen2) * speed;
+
+    const nx1 = entity.x + ax1 * dt, ny1 = entity.y + ay1 * dt;
+    const nx2 = entity.x + ax2 * dt, ny2 = entity.y + ay2 * dt;
+
+    if (!circleHitsWall(nx1, entity.y, r, maze)) { entity.x = nx1; return true; }
+    if (!circleHitsWall(entity.x, ny1, r, maze)) { entity.y = ny1; return true; }
+
+    if (!circleHitsWall(nx2, entity.y, r, maze)) { entity.x = nx2; return true; }
+    if (!circleHitsWall(entity.x, ny2, r, maze)) { entity.y = ny2; return true; }
+
+    return false;
+  }
+
   // =========================
   // Game state
   // =========================
   let level = 1;
   let maze = null;
 
-  const player = { x: 0, y: 0, vx:0, vy:0, hp: 3 };
+  const player = { x: 0, y: 0, hp: 3 };
   const exitDoor = { x: 0, y: 0 };
-  const upgrades = { pingRange: 220, pingFade: 1.2, lureless: false };
-  const pings = []; // {x,y,t,range}
-  const monster = { x:0, y:0, vx:0, vy:0, alerted:false, anger:0 };
 
-  // overlay UI
+  const upgrades = {
+    pingRange: 220,
+    pingFade: 1.2,
+    lureless: false,
+  };
+
+  const pings = []; // {x,y,t,range}
+
+  // Trail (yakın karanlıkta yön bulma)
+  const trail = []; // {x,y,t}
+  const TRAIL_TTL = 2.5;   // sec
+  const TRAIL_STEP = 10;   // px
+
+  // Monster: last heard point + state
+  const monster = {
+    x:0, y:0,
+    anger:0, // chase seconds
+    lastHeardX: 0,
+    lastHeardY: 0,
+    heardAt: -999,
+    searching: 0, // seconds to wander around lastHeard when arrives
+    wanderDirX: 1,
+    wanderDirY: 0,
+    wanderT: 0,
+  };
+
+  // overlay upgrade UI
   const overlay = document.getElementById("overlay");
   const choicesEl = document.getElementById("choices");
   const hudEl = document.getElementById("hud");
@@ -331,10 +388,11 @@
     const h = clamp(9 + lvl*2, 9, 39);
     maze = genMaze(w, h);
 
+    // player center
     player.x = (Math.floor(w/2) + 0.5) * TILE;
     player.y = (Math.floor(h/2) + 0.5) * TILE;
-    player.vx = player.vy = 0;
 
+    // exit random edge
     const edge = Math.floor(Math.random()*4);
     let ex=0, ey=0;
     if (edge===0) { ex = Math.floor(Math.random()*w); ey = 0; }
@@ -344,14 +402,20 @@
     exitDoor.x = (ex + 0.5) * TILE;
     exitDoor.y = (ey + 0.5) * TILE;
 
+    // monster far-ish from player: spawn at exit side
     monster.x = (ex + 0.5) * TILE;
     monster.y = (ey + 0.5) * TILE;
-    monster.vx = monster.vy = 0;
-    monster.alerted = false;
     monster.anger = 0;
+    monster.lastHeardX = monster.x;
+    monster.lastHeardY = monster.y;
+    monster.heardAt = -999;
+    monster.searching = 0;
+    monster.wanderDirX = 1; monster.wanderDirY = 0;
+    monster.wanderT = 0;
 
     pings.length = 0;
-    lastPingAt = -999; // now safe (declared above)
+    trail.length = 0;
+    lastPingAt = -999;
   }
 
   setupLevel(level);
@@ -375,12 +439,30 @@
 
   function makeUpgradeChoices() {
     const pool = [
-      { title:"Menzil +", desc:`Ses dalgası yarıçapı +60 (şu an: ${Math.round(upgrades.pingRange)})`, apply:()=> upgrades.pingRange += 60 },
-      { title:"Yankı Süresi +", desc:`Görünürlük süresi +0.6s (şu an: ${upgrades.pingFade.toFixed(1)}s)`, apply:()=> upgrades.pingFade += 0.6 },
-      { title:"Işık Süzmesi", desc: upgrades.lureless ? "Zaten açık: Ping canavarı çekmiyor." : "Ping atınca canavar yönlenmez (güvenli ping).", apply:()=> upgrades.lureless = true },
-      { title:"Can +1", desc:`Can +1 (şu an: ${player.hp})`, apply:()=> player.hp += 1 },
+      {
+        title: "Menzil +",
+        desc: `Ses dalgası yarıçapı +60 (şu an: ${Math.round(upgrades.pingRange)})`,
+        apply: () => upgrades.pingRange += 60
+      },
+      {
+        title: "Yankı Süresi +",
+        desc: `Görünürlük süresi +0.6s (şu an: ${upgrades.pingFade.toFixed(1)}s)`,
+        apply: () => upgrades.pingFade += 0.6
+      },
+      {
+        title: "Işık Süzmesi",
+        desc: upgrades.lureless
+          ? "Zaten açık: Ping canavarı çekmiyor."
+          : "Ping atınca canavar yönlenmez (güvenli ping).",
+        apply: () => upgrades.lureless = true
+      },
+      {
+        title: "Can +1",
+        desc: `Can +1 (şu an: ${player.hp})`,
+        apply: () => player.hp += 1
+      }
     ];
-    return pool.sort(()=>Math.random()-0.5).slice(0,3);
+    return pool.sort(() => Math.random()-0.5).slice(0, 3);
   }
 
   function renderUpgradeChoices() {
@@ -399,6 +481,7 @@
     if (!choice) return;
     choice.apply();
     closeUpgradeOverlay();
+    // mini reveal
     pings.push({ x: player.x, y: player.y, t: 0, range: upgrades.pingRange });
   }
 
@@ -415,9 +498,13 @@
     pings.push({ x: player.x, y: player.y, t: 0, range: upgrades.pingRange });
     pingSound();
 
+    // Monster hears unless lureless
     if (!upgrades.lureless) {
-      monster.alerted = true;
-      monster.anger = 2.8;
+      monster.lastHeardX = player.x;
+      monster.lastHeardY = player.y;
+      monster.heardAt = time;
+      monster.anger = 3.2;     // chase for a while
+      monster.searching = 0;   // reset search (new info)
       monsterHeardSound();
     }
   }
@@ -426,13 +513,13 @@
   // Loop
   // =========================
   let last = performance.now();
-
   function step(now) {
     const dt = Math.min(0.033, (now - last) / 1000);
     last = now;
 
     if (!overlayOpen) update(dt);
     render();
+
     requestAnimationFrame(step);
   }
   requestAnimationFrame(step);
@@ -440,6 +527,7 @@
   function update(dt) {
     time += dt;
 
+    // player movement
     const speed = 130;
     let ix = 0, iy = 0;
     if (keys.has("ArrowUp") || keys.has("w") || keys.has("W")) iy -= 1;
@@ -450,43 +538,100 @@
     const ilen = Math.hypot(ix, iy) || 1;
     ix /= ilen; iy /= ilen;
 
+    // axis slide (player)
     const nx = player.x + ix * speed * dt;
     const ny = player.y + iy * speed * dt;
-
     if (!circleHitsWall(nx, player.y, PLAYER_R, maze)) player.x = nx;
     if (!circleHitsWall(player.x, ny, PLAYER_R, maze)) player.y = ny;
 
+    // trail record
+    if (trail.length === 0) {
+      trail.push({ x: player.x, y: player.y, t: time });
+    } else {
+      const lastT = trail[trail.length - 1];
+      if (dist(lastT.x, lastT.y, player.x, player.y) >= TRAIL_STEP) {
+        trail.push({ x: player.x, y: player.y, t: time });
+      }
+    }
+    while (trail.length && (time - trail[0].t) > TRAIL_TTL) trail.shift();
+
+    // ping decay
     for (let i = pings.length - 1; i >= 0; i--) {
       pings[i].t += dt;
       if (pings[i].t > upgrades.pingFade) pings.splice(i, 1);
     }
 
-    const baseMs = 85 + level * 5;
-    if (monster.anger > 0) monster.anger -= dt;
+    // monster AI
+    const baseMs = 95 + level * 6;
 
+    // pick target
     let tx, ty;
-    if (monster.alerted && monster.anger > 0) { tx = player.x; ty = player.y; }
-    else { monster.alerted = false; tx = exitDoor.x; ty = exitDoor.y; }
 
-    const mdx = tx - monster.x, mdy = ty - monster.y;
-    const d = Math.hypot(mdx, mdy) || 1;
-    const mx = (mdx / d) * baseMs;
-    const my = (mdy / d) * baseMs;
+    if (monster.anger > 0) {
+      monster.anger -= dt;
+      // chase last heard (NOT direct player lock -> daha doğal)
+      tx = monster.lastHeardX;
+      ty = monster.lastHeardY;
+    } else if (monster.searching > 0) {
+      monster.searching -= dt;
+      // wander around last heard area
+      tx = monster.lastHeardX + monster.wanderDirX * TILE * 1.2;
+      ty = monster.lastHeardY + monster.wanderDirY * TILE * 1.2;
+    } else {
+      // patrol toward exit area slowly (keeps it moving)
+      tx = exitDoor.x;
+      ty = exitDoor.y;
+    }
 
-    const mNextX = monster.x + mx * dt;
-    const mNextY = monster.y + my * dt;
-    if (!circleHitsWall(mNextX, monster.y, MONSTER_R, maze)) monster.x = mNextX;
-    if (!circleHitsWall(monster.x, mNextY, MONSTER_R, maze)) monster.y = mNextY;
+    // if reached target and had heard recently => enter searching
+    const dToTarget = dist(monster.x, monster.y, tx, ty);
+    const heardFresh = (time - monster.heardAt) < 8; // last 8 sec relevant
+    if (monster.anger <= 0 && heardFresh && dist(monster.x, monster.y, monster.lastHeardX, monster.lastHeardY) < 10 && monster.searching <= 0) {
+      monster.searching = 2.0 + Math.random() * 1.2;
+      // pick a random wander direction (4-way)
+      const dirs = [
+        [1,0],[-1,0],[0,1],[0,-1]
+      ];
+      const pick = dirs[(Math.random() * dirs.length) | 0];
+      monster.wanderDirX = pick[0];
+      monster.wanderDirY = pick[1];
+      monster.wanderT = 0.6 + Math.random()*0.8;
+    }
 
+    // change wander dir occasionally
+    if (monster.searching > 0) {
+      monster.wanderT -= dt;
+      if (monster.wanderT <= 0) {
+        const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
+        const pick = dirs[(Math.random() * dirs.length) | 0];
+        monster.wanderDirX = pick[0];
+        monster.wanderDirY = pick[1];
+        monster.wanderT = 0.6 + Math.random()*0.8;
+      }
+    }
+
+    // steering to target
+    const mdx = tx - monster.x;
+    const mdy = ty - monster.y;
+    const mlen = Math.hypot(mdx, mdy) || 1;
+    const mvx = (mdx / mlen) * baseMs;
+    const mvy = (mdy / mlen) * baseMs;
+
+    // movement with anti-stuck
+    tryMoveCircle(monster, mvx, mvy, MONSTER_R, maze, dt);
+
+    // rumble based on player distance
     const dToMonster = dist(monster.x, monster.y, player.x, player.y);
     const intensity = 1 - clamp(dToMonster / 260, 0, 1);
     setRumble(intensity);
 
+    // catch player
     if (dToMonster < (MONSTER_R + PLAYER_R + 2)) {
       player.hp -= 1;
       hurtThud();
 
       if (player.hp <= 0) {
+        // full restart
         player.hp = 3;
         upgrades.pingRange = 220;
         upgrades.pingFade = 1.2;
@@ -498,6 +643,7 @@
       return;
     }
 
+    // reach exit
     if (dist(player.x, player.y, exitDoor.x, exitDoor.y) < 12) {
       exitChime();
       setupLevel(level + 1);
@@ -517,6 +663,21 @@
     ctx.fillStyle = "#000";
     ctx.fillRect(0,0,W,H);
 
+    // ALWAYS-ON small halo (yakın çevre)
+    const HALO_R = 52;
+    ctx.save();
+    ctx.globalAlpha = 0.22;
+    ctx.beginPath();
+    ctx.arc(player.x - camX, player.y - camY, HALO_R, 0, Math.PI*2);
+    ctx.clip();
+    drawMaze(camX, camY);
+    drawEntities(camX, camY);
+    ctx.restore();
+
+    // trail (karanlıkta yön hissi)
+    drawTrail(camX, camY);
+
+    // pings reveal
     for (const p of pings) {
       const t = p.t / upgrades.pingFade;
       const radius = lerp(0, p.range, clamp(p.t / 0.25, 0, 1));
@@ -527,10 +688,8 @@
       ctx.beginPath();
       ctx.arc(p.x - camX, p.y - camY, radius, 0, Math.PI*2);
       ctx.clip();
-
       drawMaze(camX, camY);
       drawEntities(camX, camY);
-
       ctx.restore();
     }
 
@@ -544,10 +703,38 @@
         · Ses: <b>${audio.enabled ? "Açık" : "Kapalı"}</b>
       </div>
       <div class="muted" style="margin-top:6px">
-        Amaç: Çıkış kapısını bul (yeşil). Ping atınca ortam anlık görünür.
-        (Işık Süzmesi kapalıysa canavar sesi duyar.)
+        Ping atınca çevre görünür. (Işık Süzmesi kapalıysa canavar son sesi takip eder.)
+        Halo+iz: ping yokken bile kaybolma.
       </div>
     `;
+  }
+
+  function drawTrail(camX, camY) {
+    if (trail.length < 2) return;
+    ctx.save();
+    ctx.lineWidth = 2;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+
+    for (let i = 1; i < trail.length; i++) {
+      const a = trail[i - 1];
+      const b = trail[i];
+      const age = time - b.t;
+      const alpha = 0.35 * (1 - clamp(age / TRAIL_TTL, 0, 1));
+      ctx.strokeStyle = `rgba(255,255,255,${alpha})`;
+      ctx.beginPath();
+      ctx.moveTo(a.x - camX, a.y - camY);
+      ctx.lineTo(b.x - camX, b.y - camY);
+      ctx.stroke();
+    }
+
+    const last = trail[trail.length - 1];
+    ctx.fillStyle = "rgba(255,255,255,0.35)";
+    ctx.beginPath();
+    ctx.arc(last.x - camX, last.y - camY, 2.5, 0, Math.PI*2);
+    ctx.fill();
+
+    ctx.restore();
   }
 
   function drawMaze(camX, camY) {
@@ -581,6 +768,7 @@
       }
     }
 
+    // exit door
     ctx.save();
     ctx.fillStyle = "rgba(60, 255, 140, 0.95)";
     ctx.strokeStyle = "rgba(0,0,0,0.6)";
@@ -593,6 +781,7 @@
   }
 
   function drawEntities(camX, camY) {
+    // player
     ctx.save();
     ctx.fillStyle = "rgba(255,255,255,0.95)";
     ctx.beginPath();
@@ -600,14 +789,16 @@
     ctx.fill();
     ctx.restore();
 
+    // monster
     ctx.save();
     ctx.fillStyle = "rgba(255, 80, 80, 0.95)";
     ctx.beginPath();
     ctx.arc(monster.x - camX, monster.y - camY, MONSTER_R, 0, Math.PI*2);
     ctx.fill();
 
-    if (monster.alerted && monster.anger > 0) {
-      ctx.globalAlpha = 0.25;
+    // aura if recently heard / searching
+    if (monster.anger > 0 || monster.searching > 0) {
+      ctx.globalAlpha = 0.22;
       ctx.beginPath();
       ctx.arc(monster.x - camX, monster.y - camY, 18, 0, Math.PI*2);
       ctx.fill();
